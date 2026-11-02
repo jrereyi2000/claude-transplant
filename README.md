@@ -1,6 +1,6 @@
 <h1 align="center">claude-transplant</h1>
 
-<h3 align="center">Move Claude Code history between accounts in Claude Desktop. Menubar or CLI.</h3>
+<h3 align="center">Move Claude Code history between accounts in Claude Desktop. macOS menubar, Windows system tray, or CLI.</h3>
 
 <p align="center"><a href="https://www.npmjs.com/package/claude-transplant"><img src="https://img.shields.io/npm/v/claude-transplant" alt="npm version"></a> <a href="https://github.com/vitaliyhayda/claude-transplant/actions/workflows/ci.yml"><img src="https://github.com/vitaliyhayda/claude-transplant/actions/workflows/ci.yml/badge.svg" alt="CI"></a> <a href="https://github.com/vitaliyhayda/claude-transplant/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/claude-transplant" alt="MIT license"></a></p>
 
@@ -29,8 +29,8 @@ Switch accounts in Claude Desktop and the Code sidebar goes empty. The session h
 
 - Moves local Desktop session records to another account. Transcripts and sidecars stay on disk, sessions keep their ids, nothing is copied, and `undo` reverses the whole move.
 - Sessions with a running Desktop worker wait until you approve a restart, or stay behind with Move only the rest.
-- `--cloud` also archives the source account's Remote Control copies once the local session verifies.
-- macOS only. Unofficial, not affiliated with Anthropic.
+- `--cloud` also archives the source account's Remote Control copies once the local session verifies (macOS only).
+- macOS and Windows. Unofficial, not affiliated with Anthropic.
 
 Where it fits next to the other tools people find for this problem:
 
@@ -43,10 +43,10 @@ Where it fits next to the other tools people find for this problem:
 
 ## Install
 
-Node 22 or newer. The menubar also needs the Xcode command line tools: `xcode-select --install`
+Node 22 or newer. On macOS, `menubar` uses `swiftc` from the Xcode command line tools (`xcode-select --install`). On Windows, `menubar` (or `tray`) compiles `tray.cs` with the built-in .NET Framework compiler (`csc.exe`, preinstalled on Windows 10 and 11).
 
 ```
-npx claude-transplant menubar   # install the menubar app
+npx claude-transplant menubar   # install the macOS menubar or Windows system tray app
 npx claude-transplant           # CLI
 npm i -g claude-transplant      # global install, then claude-transplant
 ```
@@ -89,9 +89,9 @@ To    ↑↓ move · enter confirm
 | `--dry-run` | plan only, write nothing |
 | `undo` | restore the last move, refused if a moved session changed or is still open, a new fork needs its parent, or a source can't be restored |
 | `accounts` | list accounts |
-| `menubar` | install the menubar app, `--snapshot <png>` renders the live panel, `--remove` uninstalls |
+| `menubar` | install the macOS menubar or Windows system tray app (`tray` is an alias), `--snapshot <png>` renders the live panel, `--remove` uninstalls |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
-| `--cloud` | reconcile the active source's Remote Control copies, queue the rest |
+| `--cloud` | reconcile the active source's Remote Control copies, queue the rest (macOS only) |
 | `--json` | one event per line |
 
 `finish`, `sweep`, `restart`, `keep-local`, `--move-only` and `--restart-approved` handle held work, cloud checks and restarts. `claude-transplant --help` describes each.
@@ -118,7 +118,7 @@ Command and flag names are stable. Renames get a deprecation release first.
 
 ### Why is the Code sidebar empty after switching accounts?
 
-Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` and lists only the signed-in folder. The transcripts in `~/.claude/projects` are shared by every account.
+Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` on macOS (or `%APPDATA%\Claude\claude-code-sessions\<account>\<organization>`, and `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code-sessions\<account>\<organization>` for MSIX Store/installer builds on Windows) and lists only the signed-in folder. The transcripts in `~/.claude/projects` are shared by every account.
 
 ### My sessions disappeared after signing out, an update, or a reset. Is this the fix?
 
@@ -138,7 +138,7 @@ Team owners get usage analytics only. Enterprise compliance tooling can retrieve
 
 ### Does it work on Windows or Linux?
 
-Not yet. Desktop uses the same per-account folder layout there, so the CLI needs only the platform paths and process checks, and the menubar stays macOS. PRs welcome, and claude-code-session-restorer covers Windows rebuilds meanwhile.
+macOS and Windows are supported (`menubar` / `tray` and CLI, covering both Squirrel/direct `%APPDATA%\Claude` installs and MSIX `%LOCALAPPDATA%\Packages\Claude_*` installs). `--cloud` Remote Control reconciliation is currently macOS-only; Windows performs verified local session and scheduled-task moves with full undo and non-destructive Desktop restart support. Linux is not yet supported.
 
 Shorter answers:
 
@@ -229,7 +229,7 @@ The active badge comes from Desktop's own `main.log`, with no Keychain read or n
 - Chat messages and sidecars stay intact. The one transcript write appends Claude Code's own empty Remote Control pointer, so a stale pointer from the old account can't hide the session's title. A destination-owned pointer stays, SSH mirrors are left alone, recovery only appends, and Undo leaves later transcript edits and newer pointers alone. It needs no `--cloud`.
 - A move to another account or organization drops the source account's saved error (`error`, `errorAt`, `priorErrorMark`) from the placed record. The quarantined original keeps it for Undo.
 - Automatic retries cover the receipt's named work only. They never start a restart, store credentials, or create destination bridges.
-- One JavaScript file, no dependencies, Node 22. The menubar is one Swift file.
+- One JavaScript file, no dependencies, Node 22. The menubar/tray app is one Swift file on macOS and one C# file on Windows.
 
 </details>
 

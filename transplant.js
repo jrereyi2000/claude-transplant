@@ -2,7 +2,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
-import { constants, createReadStream, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { constants, createReadStream, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync } from 'node:fs'
 import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile as readBytes, readlink, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -25,7 +25,42 @@ const SCHEDULER_OWNS = 'Desktop scheduler requires an approved restart'
 const TASK_STATE_KEYS = ['recordedSkips', 'runRetries']
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
 const TASK_FAMILY_BLOCKED = 'scheduled task family blocked by'
+const IS_WINDOWS = process.platform === 'win32'
+const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0
+const O_NONBLOCK = constants.O_NONBLOCK ?? 0
+const statSyncSafe = file => { try { return statSync(file) } catch { return null } }
+const sameMapped = (a, b, platform = process.platform) => typeof a === 'string' && typeof b === 'string' && (platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b)
+const realMatch = async file => sameMapped(await realpath(file), path.resolve(file))
+const portableRel = (from, to) => path.relative(from, to).replaceAll('\\', '/')
+const windowsSlashes = value => typeof value === 'string' ? value.replaceAll('/', '\\').toLowerCase() : ''
 const desktopExecutable = (file) => typeof file === 'string' && file.endsWith('/Claude.app/Contents/MacOS/Claude')
+const windowsDesktopBinary = (file, app = null) => {
+  if (typeof file !== 'string' || !file) return false
+  const normalized = windowsSlashes(file)
+  if (!normalized.endsWith('\\claude.exe') || normalized.includes('\\claude-code\\') || normalized.includes('\\claude-code-vm\\') || normalized.includes('\\.local\\bin\\')) return false
+  if (typeof app === 'string' && app && !app.toLowerCase().startsWith('shell:') && normalized === windowsSlashes(app)) return true
+  return /\\windowsapps\\claude_[^\\]+\\(?:app\\)?claude\.exe$|\\anthropicclaude\\(?:app-[^\\]+\\)?claude\.exe$|\\programs\\claude\\claude\.exe$|\\program files(?: \(x86\))?\\claude\\claude\.exe$/.test(normalized)
+}
+const macBundleExecutable = app => typeof app === 'string' && app ? path.posix.join(app.replaceAll('\\', '/'), 'Contents/MacOS/Claude') : null
+const isDesktopProcess = (row, app = null) => {
+  if (!row || typeof row.executable !== 'string') return false
+  if (row.desktopMain !== undefined) return Boolean(row.desktopMain)
+  return desktopExecutable(row.executable) || Boolean(app && row.executable === macBundleExecutable(app)) || windowsDesktopBinary(row.executable, app)
+}
+const desktopAppTarget = (executable, fallback = null) => {
+  if (typeof executable !== 'string' || !executable) return fallback
+  const posixForm = executable.replaceAll('\\', '/')
+  if (posixForm.endsWith('/Contents/MacOS/Claude')) return path.posix.resolve(posixForm, '../../..')
+  const normalized = executable.replaceAll('/', '\\')
+  const msix = normalized.match(/\\WindowsApps\\(Claude)_[^\\]+_([A-Za-z0-9]{13})\\/i)
+  if (msix) return `shell:AppsFolder\\Claude_${msix[2]}!Claude`
+  const squirrel = normalized.match(/^(.+\\AnthropicClaude)\\app-[^\\]+\\claude\.exe$/i)
+  if (squirrel) {
+    const stub = `${squirrel[1]}\\claude.exe`
+    return IS_WINDOWS && !statSyncSafe(stub)?.isFile() ? executable : stub
+  }
+  return fallback?.toLowerCase?.().startsWith('shell:') && /\\WindowsApps\\/i.test(normalized) ? fallback : executable
+}
 const SHUTDOWN_WAIT = 30_000
 const REOPEN_RESERVE = 8_000
 const STALL_WAIT = 60_000
@@ -33,6 +68,8 @@ const localActivity = new AsyncLocalStorage()
 const productive = () => localActivity.getStore()?.progress()
 const readFile = async (...args) => { const data = await readBytes(...args); productive(); return data }
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
+const TRAY_RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
+const TRAY_RUN_NAME = 'Claude Transplant'
 const SEMANTIC_VERSION = 3
 const CACHE_VERSION = 13
 const ARTIFACT_BYTES = 512 * 1024 * 1024
@@ -55,10 +92,10 @@ const HELP = `claude-transplant   move Claude Code history between accounts
   claude-transplant accounts    list accounts
   claude-transplant restart     plan an explicit Desktop restart
   claude-transplant sweep       verify placed metadata and retry the active pending source
-  claude-transplant menubar     install the menubar app, --snapshot <png>, --remove uninstalls
+  claude-transplant menubar     install the menubar/tray app, --snapshot <png>, --remove uninstalls
 
   --from <match> --to <match>   skip the picker, match on email, org name, or uuid prefix
-  --cloud                       reconcile active source, queue remaining local work and known source mirrors
+  --cloud                       reconcile active source, queue remaining local work and known source mirrors (macOS)
   --move-only                   move eligible records without restarting Desktop
   --restart-approved <token>    execute the exact restart plan previously displayed
   --json                        machine-readable output
@@ -233,6 +270,129 @@ const milliseconds = (value) => {
 const typed = (e) => e && typeof e === 'object' && TYPES.has(e.type) && typeof e.uuid === 'string' && !e.isSidechain
 const message = (e) => typed(e) && e.type !== 'progress'
 
+const windowsCsc = (env = process.env) => {
+  const root = env.SystemRoot || env.windir || 'C:\\Windows'
+  for (const dir of ['Framework64', 'Framework']) {
+    const candidate = path.win32.join(root, 'Microsoft.NET', dir, 'v4.0.30319', 'csc.exe')
+    if (statSyncSafe(candidate)?.isFile()) return candidate
+  }
+  return null
+}
+
+const compileTray = (source, binary, winexe = true) => {
+  const csc = windowsCsc()
+  if (!csc) throw new Error('csc.exe not found in Microsoft.NET Framework v4.0.30319')
+  const refs = ['System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Management.dll', 'System.Web.Extensions.dll', 'System.Windows.Forms.dll']
+  const args = ['/nologo', '/optimize+', `/target:${winexe ? 'winexe' : 'exe'}`, `/out:${binary}`, ...refs.map(ref => `/r:${ref}`), source]
+  const build = spawnSync(csc, args, { encoding: 'utf8', windowsHide: true, timeout: 60_000 })
+  if (build.error) throw new Error(`csc.exe failed: ${build.error.message}`)
+  if (build.status !== 0) throw new Error(`csc.exe failed\n${(build.stdout || build.stderr || '').trim()}`)
+}
+
+let cachedWindowsHelper
+const windowsHelper = () => {
+  if (cachedWindowsHelper !== undefined) return cachedWindowsHelper
+  try {
+    const source = path.join(HERE, 'tray.cs')
+    const hash = sha(readFileSync(source)).slice(0, 16)
+    const binary = path.join(os.tmpdir(), `claude-transplant-helper-${hash}.exe`)
+    if (!statSyncSafe(binary)?.isFile()) {
+      const temp = `${binary}.${process.pid}.${randomUUID()}.exe`
+      try {
+        compileTray(source, temp, false)
+        try { renameSync(temp, binary) } catch { if (!statSyncSafe(binary)?.isFile()) throw new Error('helper install failed') }
+      } finally {
+        try { unlinkSync(temp) } catch {}
+      }
+    }
+    cachedWindowsHelper = binary
+  } catch {
+    cachedWindowsHelper = null
+  }
+  return cachedWindowsHelper
+}
+
+const macBundle = app => typeof app === 'string' && app.endsWith('.app')
+const quitDesktopCommand = (paths, pid) => {
+  if (macBundle(paths.claudeApp) || (!IS_WINDOWS && !windowsDesktopBinary(paths.claudeApp) && !String(paths.claudeApp ?? '').toLowerCase().startsWith('shell:'))) {
+    return ['/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`]]
+  }
+  const helper = IS_WINDOWS ? windowsHelper() : null
+  return helper ? [helper, ['--quit', String(pid)]] : ['taskkill.exe', ['/PID', String(pid)]]
+}
+const openDesktopCommand = paths => {
+  if (macBundle(paths.claudeApp) || (!IS_WINDOWS && !windowsDesktopBinary(paths.claudeApp) && !String(paths.claudeApp ?? '').toLowerCase().startsWith('shell:'))) {
+    return ['/usr/bin/open', ['-g', '-a', paths.claudeApp]]
+  }
+  const helper = IS_WINDOWS ? windowsHelper() : null
+  if (helper) return [helper, ['--open', paths.claudeApp]]
+  return String(paths.claudeApp ?? '').toLowerCase().startsWith('shell:')
+    ? ['explorer.exe', [paths.claudeApp]]
+    : ['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', 'Start-Process -FilePath $args[0]', paths.claudeApp]]
+}
+
+export function parseWindowsProcesses(output, app = '', registrations = []) {
+  const trimmed = String(output ?? '').trim()
+  if (!trimmed) return []
+  let parsed
+  try { parsed = JSON.parse(trimmed) } catch { throw new Error('cannot parse worker process identity') }
+  const items = Array.isArray(parsed) ? parsed : [parsed]
+  const raw = items.map(item => {
+    if (!item || !Number.isSafeInteger(item.ProcessId) || !Number.isSafeInteger(item.ParentProcessId)) throw new Error('cannot parse worker process identity')
+    const executable = String(item.ExecutablePath || item.Name || '').trim()
+    const commandLine = String(item.CommandLine ?? '')
+    const started = String(item.Started ?? '').trim()
+    if (!executable) throw new Error('cannot parse worker process identity')
+    const base = path.win32.basename(executable).toLowerCase()
+    const desktopCandidate = windowsDesktopBinary(executable, app)
+    const helper = /\s--type=|\s--squirrel-/i.test(` ${commandLine}`)
+    const nodeCli = (base === 'node.exe' || base === 'node') && /claude-code/i.test(commandLine)
+    const cliBinary = (base === 'claude.exe' || base === 'claude') && !desktopCandidate
+    return {
+      pid: item.ProcessId,
+      ppid: item.ParentProcessId,
+      started,
+      executable,
+      commandLine,
+      desktopCandidate: desktopCandidate && !helper,
+      worker: cliBinary || nodeCli,
+      ids: (commandLine.match(UUIDS) ?? []).map(id => id.toLowerCase())
+    }
+  })
+  const candidatePids = new Set(raw.filter(row => row.desktopCandidate).map(row => row.pid))
+  const parentDesktopCandidates = new Set(raw.filter(row => row.desktopCandidate && candidatePids.has(row.ppid)).map(row => row.ppid))
+  for (const row of raw) row.desktopMain = row.desktopCandidate && !parentDesktopCandidates.has(row.pid)
+  for (const row of raw) {
+    const registered = registrations.find(item => {
+      if (item.pid !== row.pid || item.pidDomain !== 'win32' || !UUID.test(item.sessionId ?? '')) return false
+      const processStart = Date.parse(row.started)
+      const regRaw = item.procStart ?? item.startedAt
+      const regStart = typeof regRaw === 'number' ? regRaw : /^\d+$/.test(String(regRaw ?? '')) ? Number(regRaw) : Date.parse(/Z|[+-]\d\d:?\d\d|GMT|UTC/i.test(String(regRaw ?? '')) ? String(regRaw) : `${regRaw} UTC`)
+      return Number.isFinite(processStart) && Number.isFinite(regStart) && Math.abs(regStart - processStart) < 2000
+    })
+    if (registered && (row.worker || !row.desktopCandidate && !windowsDesktopBinary(row.executable, app))) {
+      row.worker = true
+      row.ids = [...new Set([...row.ids, registered.sessionId.toLowerCase()])]
+      row.cwd = typeof registered.cwd === 'string' ? registered.cwd : null
+      row.sessionName = typeof registered.name === 'string' ? registered.name : null
+    }
+    delete row.commandLine
+    delete row.desktopCandidate
+  }
+  const byPid = new Map(raw.map(row => [row.pid, row]))
+  for (const row of raw) {
+    const visited = new Set()
+    let parent = row
+    row.desktopPid = null
+    while (parent && !visited.has(parent.pid)) {
+      visited.add(parent.pid)
+      if (parent.desktopMain) { row.desktopPid = parent.pid; break }
+      parent = byPid.get(parent.ppid)
+    }
+  }
+  return raw
+}
+
 export function parseProcesses(processes, commands, app = '/Applications/Claude.app', registrations = []) {
   const pattern = /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d+:\d+:\d+\s+\d{4})\s+(.+)$/
   const identities = new Map(commands.split('\n').filter((line) => line.trim()).map((line) => {
@@ -264,28 +424,41 @@ export function parseProcesses(processes, commands, app = '/Applications/Claude.
     row.desktopPid = null
     while (parent && !visited.has(parent.pid)) {
       visited.add(parent.pid)
-      if (desktopExecutable(parent.executable) || parent.executable === path.join(app, 'Contents/MacOS/Claude')) { row.desktopPid = parent.pid; break }
+      if (desktopExecutable(parent.executable) || parent.executable === macBundleExecutable(app)) { row.desktopPid = parent.pid; break }
       parent = byPid.get(parent.ppid)
     }
   }
   return rows
 }
 
-const processTable = (app) => {
-  const options = { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 2000, env: { ...process.env, LC_ALL: 'C' } }
-  const processes = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], options)
-  const commands = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], options)
-  if ([processes, commands].some((result) => result.error || result.status !== 0)) throw new Error('cannot inspect running workers')
+const sessionRegistrations = () => {
   const directory = path.join(os.homedir(), '.claude/sessions')
-  let registrations = []
   try {
-    registrations = readdirSync(directory).filter(name => /^\d+\.json$/.test(name)).flatMap(name => {
+    return readdirSync(directory).filter(name => /^\d+\.json$/.test(name)).flatMap(name => {
       try {
         const row = JSON.parse(readFileSync(path.join(directory, name), 'utf8'))
         return row.pid === Number(name.slice(0, -5)) ? [row] : []
       } catch { return [] }
     })
-  } catch {}
+  } catch { return [] }
+}
+
+const processTable = (app) => {
+  const registrations = sessionRegistrations()
+  if (IS_WINDOWS) {
+    const helper = windowsHelper()
+    const result = helper
+      ? spawnSync(helper, ['--ps'], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 10_000, windowsHide: true })
+      : spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+          "@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{N='Started';E={if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{''}}},Name,ExecutablePath,CommandLine) | ConvertTo-Json -Compress"],
+        { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 15_000, windowsHide: true })
+    if (result.error || result.status !== 0) throw new Error('cannot inspect running workers')
+    return parseWindowsProcesses(result.stdout, app, registrations)
+  }
+  const options = { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 2000, env: { ...process.env, LC_ALL: 'C' } }
+  const processes = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], options)
+  const commands = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], options)
+  if ([processes, commands].some((result) => result.error || result.status !== 0)) throw new Error('cannot inspect running workers')
   return parseProcesses(processes.stdout, commands.stdout, app, registrations)
 }
 const workers = (rows = processTable()) => Object.assign(new Set(rows.filter((row) => row.worker && row.pid !== row.desktopPid).flatMap((row) => row.ids)), { rows })
@@ -324,7 +497,7 @@ const canRestartWaiting = (receipt, table) => waitingSessions(receipt).some(row 
 })
 
 export async function restartPlan(inv, paths, table = processTable(paths.claudeApp)) {
-  const apps = table.filter((row) => desktopExecutable(row.executable) || row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+  const apps = table.filter((row) => isDesktopProcess(row, paths.claudeApp))
   if (apps.length !== 1) return null
   const desktop = apps[0]
   const all = await accounts(paths)
@@ -387,7 +560,7 @@ export async function restartPlan(inv, paths, table = processTable(paths.claudeA
   })
   const selected = new Set(held.flatMap((row) => row.workers.map(processIdentity)))
   const members = table.filter((row) => row.desktopPid === desktop.pid).map(({ pid, started }) => ({ pid, started }))
-  return { app: path.resolve(desktop.executable, '../../..'), desktop: { pid: desktop.pid, started: desktop.started }, members, held, affected,
+  return { app: desktopAppTarget(desktop.executable, paths.claudeApp), desktop: { pid: desktop.pid, started: desktop.started }, members, held, affected,
     interrupts: affected.filter((row, index) => !owned[index].workers.some(worker => selected.has(processIdentity(worker)))), fingerprint: restartFingerprint(desktop, table) }
 }
 
@@ -398,10 +571,12 @@ const waitFor = async (predicate, deadline, now = () => performance.now(), wait 
     await wait(Math.min(250, deadline - now()))
   } while (true)
 }
-const appProcess = (paths, table = processTable(paths.claudeApp)) => table.find((row) => row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+const appProcess = (paths, table = processTable(paths.claudeApp)) => macBundle(paths.claudeApp)
+  ? table.find((row) => row.executable === macBundleExecutable(paths.claudeApp))
+  : table.find((row) => isDesktopProcess(row, paths.claudeApp))
 const command = (file, args, timeout) => new Promise((resolve) => {
   if (timeout <= 0) return resolve({ status: null, timedOut: true })
-  const child = spawn(file, args, { stdio: 'ignore' })
+  const child = spawn(file, args, { stdio: 'ignore', windowsHide: true })
   let settled = false
   const finish = (result) => { if (!settled) { settled = true; clearTimeout(timer); resolve(result) } }
   const timer = setTimeout(() => { child.kill('SIGTERM'); finish({ status: null, timedOut: true }) }, timeout)
@@ -422,7 +597,7 @@ async function appendRestartEvent(paths, event) {
       await rm(`${file}.1`, { force: true })
       await rename(file, `${file}.1`)
     }
-    const handle = await open(file, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600)
+    const handle = await open(file, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | O_NOFOLLOW, 0o600)
     try { await handle.chmod(0o600); await handle.writeFile(text) } finally { await handle.close() }
   } catch {}
 }
@@ -435,7 +610,7 @@ async function foldRestartHistory(paths, file, receipt) {
   for (const name of ['restart-events.jsonl.1', 'restart-events.jsonl']) {
     let handle
     try {
-      handle = await open(path.join(paths.state, name), constants.O_RDONLY | constants.O_NOFOLLOW)
+      handle = await open(path.join(paths.state, name), constants.O_RDONLY | O_NOFOLLOW)
       const detail = await handle.stat()
       if (!detail.isFile() || detail.size > RESTART_LOG_BYTES) continue
       const text = await handle.readFile('utf8')
@@ -496,7 +671,9 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   const check = (force = false) => {
     if (now() - lastProgress >= (io.stallWait ?? STALL_WAIT)) throw Object.assign(new Error('The move stopped making progress'), { code: 'MOVE_STALLED' })
     if (!force && now() < nextInspection) return
-    const possible = io.inspect || spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' }).status !== 1
+    const possible = io.inspect || (IS_WINDOWS
+      ? Boolean(spawnSync('tasklist.exe', ['/FI', 'IMAGENAME eq claude.exe', '/NH'], { encoding: 'utf8', windowsHide: true }).stdout?.toLowerCase().includes('claude.exe'))
+      : spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' }).status !== 1)
     if (possible && appProcess(paths, inspect())) throw Object.assign(new Error('Claude Desktop reopened before the held move finished. Retry the move.'), { code: 'RESTART_REOPENED' })
     nextInspection = now() + 100
     if (now() - lastProgress >= (io.stallWait ?? STALL_WAIT)) throw Object.assign(new Error('The move stopped making progress'), { code: 'MOVE_STALLED' })
@@ -512,7 +689,8 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (plan.held.some((held) => live.some((row) => row.worker && row.desktopPid !== desktop.pid && ownsWorker(new Set(row.ids), held.id, held.recordId)))) throw Object.assign(new Error('An external worker now owns a held session. No restart was started.'), { code: 'RESTART_EXTERNAL_WORKER' })
     report('desktop', 'Closing Claude Desktop', { live: true })
     const shutdownDeadline = now() + shutdownWait
-    const quit = await run('/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`], Math.max(0, shutdownDeadline - now()))
+    const [quitFile, quitArgs] = quitDesktopCommand(paths, desktop.pid)
+    const quit = await run(quitFile, quitArgs, Math.max(0, shutdownDeadline - now()))
     const gone = quit.status === 0 && await waitFor(() => !inspect().some((row) => plan.members.some((prior) => processIdentity(prior) === processIdentity(row))), shutdownDeadline, now, wait)
     if (!gone || quit.status !== 0) {
       state.outcome = quit.timedOut ? 'quit-timeout' : 'quit-not-confirmed'
@@ -537,7 +715,8 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.outcome = 'reopening'
       const reopenDeadline = now() + reserve
       const remaining = reopenDeadline - now()
-      const opening = (async () => run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1, remaining)))()
+      const [openFile, openArgs] = openDesktopCommand(paths)
+      const opening = (async () => run(openFile, openArgs, Math.max(1, remaining)))()
       try { report('reopen', 'Opening Claude Desktop', { live: true }) } catch {}
       const opened = await opening.catch(() => ({ status: null }))
       const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, reopenDeadline, now, wait)
@@ -572,7 +751,59 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   return { result, restart: state, code: stopCode, error: failure?.message ?? state.error, ok: state.outcome === 'reopened' && !state.error && result?.ok !== false }
 }
 
-export function layout(home = os.homedir()) {
+const windowsLayout = (home, options = {}) => {
+  const p = options.platform === 'win32' && !IS_WINDOWS ? path.win32 : path
+  const env = options.env ?? (IS_WINDOWS && home === os.homedir() ? process.env : {})
+  const probeStat = options.stat ?? (target => statSyncSafe(IS_WINDOWS ? target : target.replaceAll('\\', '/')))
+  const probeDirs = options.readdir ?? (dir => { try { return readdirSync(IS_WINDOWS ? dir : dir.replaceAll('\\', '/')) } catch { return [] } })
+  const roaming = env.APPDATA || p.join(home, 'AppData', 'Roaming')
+  const local = env.LOCALAPPDATA || p.join(home, 'AppData', 'Local')
+  const standardRoot = p.join(roaming, 'Claude')
+  const squirrelExe = p.join(local, 'AnthropicClaude', 'claude.exe')
+  const packagesDir = p.join(local, 'Packages')
+  const packages = probeDirs(packagesDir).filter(name => /^Claude_[a-z0-9]+$/i.test(name)).sort((a, b) => (a.toLowerCase() === 'claude_pzs8sxrjxfjjc' ? -1 : b.toLowerCase() === 'claude_pzs8sxrjxfjjc' ? 1 : a.localeCompare(b)))
+  const candidates = [
+    { root: standardRoot, app: squirrelExe, msix: false },
+    ...packages.map(pkg => ({ root: p.join(packagesDir, pkg, 'LocalCache', 'Roaming', 'Claude'), app: `shell:AppsFolder\\${pkg}!Claude`, msix: true }))
+  ]
+  const score = candidate => {
+    const sessions = probeStat(p.join(candidate.root, 'claude-code-sessions'))
+    const config = probeStat(p.join(candidate.root, 'config.json'))
+    const mainLog = probeStat(p.join(candidate.root, 'logs', 'main.log'))
+    const mtime = Math.max(config?.mtimeMs ?? 0, mainLog?.mtimeMs ?? 0, sessions?.mtimeMs ?? 0)
+    const tier = sessions?.isDirectory?.() ? 2 : (config?.isFile?.() || mainLog?.isFile?.()) ? 1 : 0
+    return { tier, mtime }
+  }
+  let chosen = candidates[0], best = score(chosen)
+  for (const candidate of candidates.slice(1)) {
+    const current = score(candidate)
+    if (current.tier > best.tier || (current.tier === best.tier && current.tier > 0 && current.mtime > best.mtime) ||
+      (best.tier === 0 && current.tier === 0 && !probeStat(squirrelExe)?.isFile?.())) {
+      chosen = candidate
+      best = current
+    }
+  }
+  const directLogs = p.join(chosen.root, 'logs'), fallbackLogs = p.join(local, 'Claude', 'Logs')
+  const logs = probeStat(directLogs)?.isDirectory?.() || !probeStat(fallbackLogs)?.isDirectory?.() ? directLogs : fallbackLogs
+  return {
+    home,
+    records: p.join(chosen.root, 'claude-code-sessions'),
+    agentSessions: p.join(chosen.root, 'local-agent-mode-sessions'),
+    desktop: p.join(chosen.root, 'config.json'),
+    logs,
+    cookies: p.join(chosen.root, 'Network', 'Cookies'),
+    claudeApp: chosen.app,
+    pool: p.join(home, '.claude', 'projects'),
+    login: p.join(home, '.claude.json'),
+    backups: p.join(home, '.claude', 'backups'),
+    switchAccounts: p.join(home, '.claude-switch', 'accounts'),
+    state: p.join(local, 'claude-transplant')
+  }
+}
+
+export function layout(home = os.homedir(), options = {}) {
+  const platform = options.platform ?? process.platform
+  if (platform === 'win32') return windowsLayout(home, { ...options, platform })
   const support = path.join(home, 'Library/Application Support')
   return {
     home,
@@ -596,24 +827,24 @@ async function dirs(root) {
 }
 
 const mappedPath = async file => path.join(await realpath(path.dirname(file)), path.basename(file))
-const sameTree = (expected, current) => Boolean(current) && expected.fingerprint === current.fingerprint && (!expected.canonicalRoot || expected.canonicalRoot === current.canonicalRoot)
+const sameTree = (expected, current) => Boolean(current) && expected.fingerprint === current.fingerprint && (!expected.canonicalRoot || sameMapped(expected.canonicalRoot, current.canonicalRoot))
 
 async function tree(root, canonicalRoot) {
   const out = []
   const walk = async (dir) => {
     const before = await lstat(dir, { bigint: true })
-    if (!before.isDirectory() || await realpath(dir) !== path.resolve(dir)) throw new Error(`unsupported entry ${path.join(root, path.relative(canonicalRoot, dir))}`)
+    if (!before.isDirectory() || !(await realMatch(dir))) throw new Error(`unsupported entry ${path.join(root, path.relative(canonicalRoot, dir))}`)
     for (const e of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
       const p = path.join(dir, e.name)
       if (e.isDirectory()) await walk(p)
       else if (e.isFile() || e.isSymbolicLink()) out.push(p)
       else throw new Error(`unsupported entry ${p}`)
     }
-    if (statIdentity(await lstat(dir, { bigint: true })) !== statIdentity(before) || await realpath(dir) !== path.resolve(dir)) throw new Error('sidecars changed while reading')
+    if (statIdentity(await lstat(dir, { bigint: true })) !== statIdentity(before) || !(await realMatch(dir))) throw new Error('sidecars changed while reading')
   }
   const detail = await lstat(canonicalRoot).catch(error => { if (error.code === 'ENOENT') return null; throw error })
   if (detail) await walk(canonicalRoot)
-  if (await mappedPath(root) !== canonicalRoot) throw new Error('sidecar root mapping changed while reading')
+  if (!sameMapped(await mappedPath(root), canonicalRoot)) throw new Error('sidecar root mapping changed while reading')
   return out
 }
 
@@ -628,9 +859,9 @@ async function treeFingerprint(root) {
     signatures.set(file, identity)
     const fingerprint = detail.isSymbolicLink() ? `link:${identity}:${sha(await readlink(file, { encoding: 'buffer' }))}` : identity
     if (statIdentity(await lstat(file, { bigint: true })) !== identity) throw new Error('sidecars changed while reading')
-    return { rel: path.relative(canonicalRoot, file), fingerprint }
+    return { rel: portableRel(canonicalRoot, file), fingerprint }
   }))
-  if (await mappedPath(root) !== canonicalRoot) throw new Error('sidecar root mapping changed while reading')
+  if (!sameMapped(await mappedPath(root), canonicalRoot)) throw new Error('sidecar root mapping changed while reading')
   return { files, signatures, fingerprint: sha(stable(dependencies)), canonicalRoot }
 }
 
@@ -643,7 +874,7 @@ async function manifest(root, cache = null) {
   if (!prior) for (const file of files) {
     const detail = await lstat(file, { bigint: true })
     if (statIdentity(detail) !== before.signatures.get(file)) throw new Error('sidecars changed while reading')
-    const rel = path.relative(before.canonicalRoot, file)
+    const rel = portableRel(before.canonicalRoot, file)
     if (detail.isSymbolicLink()) {
       const data = await readlink(file, { encoding: 'buffer' })
       rows.push({ rel, bytes: data.length, sha: sha(data), type: 'symlink', resolved: path.resolve(path.dirname(file), data.toString('utf8')) })
@@ -759,10 +990,19 @@ async function quarantine(items, dest, before = () => {}) {
 async function locked(paths, work) {
   await mkdir(paths.state, { recursive: true })
   const lockFile = path.join(paths.state, 'lock')
-  const command = await exists('/usr/bin/lockf')
-    ? ['/usr/bin/lockf', '-k', '-s', '-w', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null']
-    : ['/usr/bin/perl', '-MFcntl=:flock', '-e', 'open(my $lock, ">>", $ARGV[0]) or exit 73; flock($lock, LOCK_EX | LOCK_NB) or exit($!{EWOULDBLOCK} ? 75 : 73); $| = 1; print "ready"; 1 while <STDIN>;', lockFile]
-  const guard = spawn(command[0], command.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
+  let command
+  if (IS_WINDOWS) {
+    const helper = windowsHelper()
+    command = helper
+      ? [helper, '--lock', lockFile]
+      : ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+        'try { $s = [System.IO.File]::Open($args[0], [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None) } catch [System.IO.IOException] { if (($_.Exception.HResult -band 0xFFFF) -in 32, 33) { exit 75 }; exit 73 } catch { exit 73 }; [Console]::Out.Write("ready"); [Console]::Out.Flush(); [Console]::In.ReadToEnd() | Out-Null; $s.Dispose()', lockFile]
+  } else {
+    command = await exists('/usr/bin/lockf')
+      ? ['/usr/bin/lockf', '-k', '-s', '-w', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null']
+      : ['/usr/bin/perl', '-MFcntl=:flock', '-e', 'open(my $lock, ">>", $ARGV[0]) or exit 73; flock($lock, LOCK_EX | LOCK_NB) or exit($!{EWOULDBLOCK} ? 75 : 73); $| = 1; print "ready"; 1 while <STDIN>;', lockFile]
+  }
+  const guard = spawn(command[0], command.slice(1), { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
   await new Promise((resolve, reject) => {
     let ready = false
     guard.stdout.once('data', () => { ready = true; resolve() })
@@ -857,7 +1097,7 @@ const taskRegistrationKind = (family, registry, target, sourcePresent = false) =
 }
 
 async function schedulerBusy(paths, namespaces, table = processTable(paths.claudeApp)) {
-  if (!table.some(row => desktopExecutable(row.executable))) return false
+  if (!table.some(row => isDesktopProcess(row, paths.claudeApp))) return false
   const current = await signedIn(paths, table)
   return current.state !== 'known' || namespaces.some(row => sameAccount(row, current))
 }
@@ -963,7 +1203,7 @@ function mode(values) {
 }
 
 const desktopLaunch = (paths, table) => {
-  const apps = table.filter(row => desktopExecutable(row.executable) || row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+  const apps = table.filter(row => isDesktopProcess(row, paths.claudeApp))
   const started = apps.length === 1 ? Date.parse(apps[0].started) : NaN
   return Number.isFinite(started) && started <= Date.now() ? { pid: apps[0].pid, started } : null
 }
@@ -973,13 +1213,13 @@ export async function idleTimeouts(paths, table) {
   if (!launch) return result
   let handle
   try {
-    handle = await open(path.join(paths.logs, 'main.log'), constants.O_RDONLY | constants.O_NOFOLLOW)
+    handle = await open(path.join(paths.logs, 'main.log'), constants.O_RDONLY | O_NOFOLLOW)
     const before = await handle.stat()
     if (!before.isFile()) return result
     const size = Math.min(before.size, 4 * 1024 * 1024), buffer = Buffer.alloc(size)
     const { bytesRead } = await handle.read(buffer, 0, size, before.size - size)
     if (bytesRead !== size) return result
-    const rows = buffer.subarray(0, bytesRead).toString('utf8').split('\n')
+    const rows = buffer.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
     const recordPattern = new RegExp(`\\[WarmLifecycle:session\\] Starting idle timeout for (local_${UUID_PATTERN}):`, 'i')
     if (size < before.size) rows.shift()
     for (const [index, line] of rows.entries()) {
@@ -1002,9 +1242,13 @@ export async function signedIn(paths, table = null) {
   const unknown = (state = 'unknown', time = null) => ({ account: null, org: null, state, source: time === null ? 'unknown' : 'log', at: time === null ? null : new Date(time).toISOString() })
   try {
     if (table === null) {
-      const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], { encoding: 'utf8', timeout: 2000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } })
-      if (result.error || result.status !== 0) return unknown()
-      table = parseProcesses(result.stdout, '', paths.claudeApp)
+      if (IS_WINDOWS) {
+        table = processTable(paths.claudeApp)
+      } else {
+        const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], { encoding: 'utf8', timeout: 2000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } })
+        if (result.error || result.status !== 0) return unknown()
+        table = parseProcesses(result.stdout, '', paths.claudeApp)
+      }
     }
     const launch = desktopLaunch(paths, table)
     if (!launch) return unknown()
@@ -1013,7 +1257,7 @@ export async function signedIn(paths, table = null) {
     const files = (await readdir(paths.logs)).filter((name) => /^main(?:[1-9]\d*)?\.log$/.test(name))
       .sort((a, b) => Number(a.slice(4, -4)) - Number(b.slice(4, -4)))
     for (const file of files) {
-      const lines = (await readFile(path.join(paths.logs, file), 'utf8')).split('\n')
+      const lines = (await readFile(path.join(paths.logs, file), 'utf8')).split(/\r?\n/)
       for (let index = lines.length - 1; index >= 0; index--) {
         const line = lines[index]
         const local = line.includes('[LocalSessionManager]')
@@ -1054,6 +1298,7 @@ async function binaryMatch(file, pattern) {
 }
 
 async function desktopUserAgent(paths) {
+  if (IS_WINDOWS) throw new Error('--cloud is supported on macOS only')
   const appInfo = path.join(paths.claudeApp, 'Contents/Info.plist')
   const framework = path.join(paths.claudeApp, 'Contents/Frameworks/Electron Framework.framework/Versions/A')
   const claude = plistValue(appInfo, 'CFBundleShortVersionString')
@@ -1074,6 +1319,7 @@ function decryptCookie(host, encrypted, key, version) {
 }
 
 function desktopCookies(paths) {
+  if (IS_WINDOWS) throw new Error('--cloud is supported on macOS only')
   const options = { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 10_000 }
   const versionResult = spawnSync('/usr/bin/sqlite3', ['-readonly', paths.cookies, "SELECT value FROM meta WHERE key='version';"], options)
   const rowsResult = spawnSync('/usr/bin/sqlite3', ['-readonly', '-separator', '\t', paths.cookies, "SELECT host_key,name,hex(CAST(value AS BLOB)),hex(encrypted_value) FROM cookies WHERE host_key IN ('.claude.ai','claude.ai') ORDER BY length(path) DESC,creation_utc;"], options)
@@ -1637,7 +1883,7 @@ const statIdentity = (detail) => [detail.dev, detail.ino, detail.size, detail.mt
 async function readRegular(file, signature = null) {
   const before = await lstat(file, { bigint: true })
   if (!before.isFile() || signature && statIdentity(before) !== signature) throw new Error(`regular file changed before reading: ${file}`)
-  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+  const handle = await open(file, constants.O_RDONLY | O_NOFOLLOW)
   try {
     if (statIdentity(await handle.stat({ bigint: true })) !== statIdentity(before)) throw new Error(`regular file changed before reading: ${file}`)
     const data = await handle.readFile()
@@ -1648,21 +1894,21 @@ async function readRegular(file, signature = null) {
 
 async function artifactStat(file) {
   const detail = await lstat(file, { bigint: true })
-  if (!detail.isFile() || await realpath(file) !== file) throw artifactError('artifact is not a regular file within its session root')
+  if (!detail.isFile() || !(await realMatch(file))) throw artifactError('artifact is not a regular file within its session root')
   return { detail, signature: statIdentity(detail) }
 }
 
 async function artifactInputs(row) {
   if (!UUID.test(row.id) || path.basename(row.transcript) !== `${row.id}.jsonl` || desktopRecordOf(row).cliSessionId !== row.id) throw artifactError('the linked parent identity is not established')
   const project = await realpath(path.dirname(row.transcript)), transcript = path.join(project, `${row.id}.jsonl`)
-  if (row.sidecar?.canonicalRoot && path.join(project, row.id) !== row.sidecar.canonicalRoot) throw artifactError('session root mapping changed')
+  if (row.sidecar?.canonicalRoot && !sameMapped(path.join(project, row.id), row.sidecar.canonicalRoot)) throw artifactError('session root mapping changed')
   const { signature } = await artifactStat(transcript), root = path.join(project, row.id), directory = path.join(root, 'subagents')
   const fingerprints = [[transcript, signature]], files = []
   for (const dir of [root, directory]) {
     const detail = await lstat(dir, { bigint: true }).catch(error => { if (error.code === 'ENOENT') return null; throw error })
     fingerprints.push([dir, detail ? statIdentity(detail) : null])
     if (!detail) break
-    if (!detail.isDirectory() || await realpath(dir) !== dir) throw artifactError('subagent root is not a real session directory')
+    if (!detail.isDirectory() || !(await realMatch(dir))) throw artifactError('subagent root is not a real session directory')
     if (dir === directory) for (const file of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
       if (!/^agent-.+\.jsonl$/.test(file.name)) continue
       const agent = file.name.slice(6, -6), name = path.join(dir, file.name)
@@ -1680,7 +1926,7 @@ async function artifactIndex(file, kind, budget) {
   const key = `${file}/${signature}/${kind}`
   if (budget.indexes.has(key)) return budget.indexes.get(key)
   const reading = (async () => {
-    const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const handle = await open(file, constants.O_RDONLY | O_NOFOLLOW)
     try {
       if (statIdentity(await handle.stat({ bigint: true })) !== signature) throw artifactError('artifact changed before reading')
       const read = async (length, position) => {
@@ -1821,9 +2067,9 @@ async function supplementalCoverage(events, row, budget, inputs = null) {
   }
   for (const [file, signature] of inputs.fingerprints) {
     const current = await lstat(file, { bigint: true }).catch(error => { if (error.code === 'ENOENT') return null; throw error })
-    if ((current ? statIdentity(current) : null) !== signature || current && await realpath(file) !== file) throw artifactError('session artifacts changed during coverage analysis')
+    if ((current ? statIdentity(current) : null) !== signature || current && !(await realMatch(file))) throw artifactError('session artifacts changed during coverage analysis')
   }
-  if (await mappedPath(row.transcript) !== inputs.transcript) throw artifactError('session root mapping changed during coverage analysis')
+  if (!sameMapped(await mappedPath(row.transcript), inputs.transcript)) throw artifactError('session root mapping changed during coverage analysis')
   if (counts.subagent !== pending.length) return null
   return { matchMode: 'artifacts', artifactCounts: counts, artifactSignature: sha(stable(events)) }
 }
@@ -2166,7 +2412,7 @@ async function retainedHistories(target, ctx, options, owners, enabled) {
       const canonicalTranscript = await mappedPath(transcript)
       const before = await artifactStat(canonicalTranscript)
       const detail = await history(id, transcript, ctx, desktopRecordOf(target).cwd)
-      if (!detail.comparable || (await artifactStat(canonicalTranscript)).signature !== before.signature || sha(await readRegular(canonicalTranscript, before.signature)) !== detail.contentSha || await mappedPath(transcript) !== canonicalTranscript) continue
+      if (!detail.comparable || (await artifactStat(canonicalTranscript)).signature !== before.signature || sha(await readRegular(canonicalTranscript, before.signature)) !== detail.contentSha || !sameMapped(await mappedPath(transcript), canonicalTranscript)) continue
       const native = [...Map.groupBy(detail.bridgeOwners, owner => owner.id).values()].flatMap(copies => {
         const owner = copies[0]
         return copies.length === 1 && owner.id && owner.sessionId === id && owners.some(source => sameAccount(owner, source)) ? [owner] : []
@@ -2382,10 +2628,10 @@ function bridgePlans(row, aliases = []) {
 }
 
 async function bridgeFile(plan, writable, work) {
-  if (await mappedPath(plan.transcript) !== plan.canonical || await realpath(plan.canonical) !== plan.canonical) throw bridgeError('transcript path changed')
+  if (!sameMapped(await mappedPath(plan.transcript), plan.canonical) || !(await realMatch(plan.canonical))) throw bridgeError('transcript path changed')
   const before = await lstat(plan.canonical, { bigint: true })
   if (!before.isFile() || plan.dev !== String(before.dev) || plan.ino !== String(before.ino)) throw bridgeError('transcript identity changed')
-  const handle = await open(plan.canonical, (writable ? constants.O_RDWR | constants.O_APPEND : constants.O_RDONLY) | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  const handle = await open(plan.canonical, (writable ? constants.O_RDWR | constants.O_APPEND : constants.O_RDONLY) | O_NOFOLLOW | O_NONBLOCK)
   try {
     await bridgeStable(plan, handle, statIdentity(before))
     return await work(handle)
@@ -2401,7 +2647,7 @@ async function bridgeStable(plan, handle, signature, inspect = null) {
   const named = await lstat(plan.canonical, { bigint: true })
   if (!current.isFile() || !named.isFile() || statIdentity(current) !== signature || statIdentity(named) !== signature ||
       String(current.dev) !== plan.dev || String(current.ino) !== plan.ino ||
-      await mappedPath(plan.transcript) !== plan.canonical || await realpath(plan.canonical) !== plan.canonical) throw bridgeError('transcript changed')
+      !sameMapped(await mappedPath(plan.transcript), plan.canonical) || !(await realMatch(plan.canonical))) throw bridgeError('transcript changed')
 }
 
 async function bridgeRead(plan, handle, parse = true) {
@@ -2785,7 +3031,7 @@ async function targetChanges(row, liveWorkers, checkShared = true, allowRecordDr
     const targetDir = row.targetDir ?? path.join(path.dirname(row.targetTranscript), row.targetId)
     const sidecarsExist = !row.sidecars?.count || await exists(targetDir)
     if (!sidecarsExist) changes.push('sidecars missing')
-    else if (row.sidecars?.canonicalRoot && await mappedPath(targetDir).catch(() => null) !== row.sidecars.canonicalRoot || checkShared && row.sidecars?.fingerprint && !sameTree(row.sidecars, await treeFingerprint(targetDir).catch(() => null))) {
+    else if (row.sidecars?.canonicalRoot && !sameMapped(await mappedPath(targetDir).catch(() => null), row.sidecars.canonicalRoot) || checkShared && row.sidecars?.fingerprint && !sameTree(row.sidecars, await treeFingerprint(targetDir).catch(() => null))) {
       changes.push('sidecars')
     }
   } else {
@@ -2937,8 +3183,9 @@ async function deferredWorkflow(paths, latest) {
   return sources.length ? { ...latest, mode: 'cloud', sources } : null
 }
 
-const syncPath = async file => {
-  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+const syncPath = async (file, directory = false) => {
+  if (IS_WINDOWS && directory) return
+  const handle = await open(file, (IS_WINDOWS ? constants.O_RDWR : constants.O_RDONLY) | O_NOFOLLOW)
   try { await handle.sync() } finally { await handle.close() }
 }
 
@@ -2949,7 +3196,7 @@ const saveText = async (file, text, before = () => {}, durable = false) => {
     if (durable) await syncPath(temp)
     await before()
     await rename(temp, file)
-    if (durable) await syncPath(path.dirname(file))
+    if (durable) await syncPath(path.dirname(file), true)
     productive()
     return text
   } finally {
@@ -3012,7 +3259,7 @@ async function placementJournal(file, receipt, check = () => {}) {
       for (const key of Object.keys(sizes)) patch[key] = (receipt[key] ?? []).slice(sizes[key])
       try {
         await handle.writeFile(jsonText(patch, 0))
-        if (durable) { await handle.sync(); await syncPath(file); await syncPath(path.dirname(file)) }
+        if (durable) { await handle.sync(); await syncPath(file); await syncPath(path.dirname(file), true) }
         productive()
       }
       catch (error) { error.code = 'JOURNAL_WRITE'; throw error }
@@ -3318,7 +3565,8 @@ async function reconcile(paths, options = {}) {
       const running = () => { try { return Boolean(appProcess(paths, inspect())) } catch { return false } }
       if (!running()) {
         const deadline = now() + REOPEN_RESERVE
-        const opened = await (io.command ?? command)('/usr/bin/open', ['-g', '-a', paths.claudeApp], REOPEN_RESERVE)
+        const [openFile, openArgs] = openDesktopCommand(paths)
+        const opened = await (io.command ?? command)(openFile, openArgs, REOPEN_RESERVE)
         restart.outcome = opened.status === 0 && await waitFor(running, deadline, now, io.wait) ? 'interrupted-reopened' : 'reopen-failed'
       } else restart.outcome = 'interrupted-app-running'
       restart.recoveredAt = new Date().toISOString()
@@ -3933,10 +4181,10 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
     }
     const liveWorkers = workers()
     const retained = match.target.retained
-    const retainedUnchanged = async () => !retained || await mappedPath(retained.transcript).catch(() => null) === retained.canonicalTranscript &&
+    const retainedUnchanged = async () => !retained || sameMapped(await mappedPath(retained.transcript).catch(() => null), retained.canonicalTranscript) &&
       await artifactStat(retained.canonicalTranscript).then(value => value.signature).catch(() => null) === retained.fingerprint &&
       await readRegular(retained.canonicalTranscript, retained.fingerprint).then(sha).catch(() => null) === retained.contentSha &&
-      await mappedPath(retained.transcript).catch(() => null) === retained.canonicalTranscript
+      sameMapped(await mappedPath(retained.transcript).catch(() => null), retained.canonicalTranscript)
     const targetOkay = row?.targetId
       ? !(await targetChanges(row, liveWorkers, true)).length
       : row ? await untouched(row, liveWorkers) : false
@@ -4765,7 +5013,7 @@ export function executeMove(from, to, paths, options = {}) {
     }
     if (!chosen && options.recover) return { reconciled: await reconcileFiles(paths, { ...options, inspect }), recoveryRequired: true, ok: false }
     if (!chosen && options.undo) return undoFiles(paths, { ...options, inspect })
-    if (!chosen) return inspect().filter((row) => desktopExecutable(row.executable)).length > 1
+    if (!chosen) return inspect().filter((row) => isDesktopProcess(row, paths.claudeApp)).length > 1
       ? { ok: false, reason: 'More than one Claude Desktop instance is running. Close the extra instance before restarting.' }
       : { nothing: true, ok: true }
     const { inv, target } = initial
@@ -4997,7 +5245,7 @@ export function step(state, key) {
     next.has(cursor) ? next.delete(cursor) : next.add(cursor)
     return { ...state, chosen: next }
   }
-  if (key === 'return') return multi ? (chosen.size ? { ...state, done: true } : state) : { ...state, chosen: new Set([cursor]), done: true }
+  if (key === 'return' || key === 'enter') return multi ? (chosen.size ? { ...state, done: true } : state) : { ...state, chosen: new Set([cursor]), done: true }
   return state
 }
 
@@ -5095,7 +5343,64 @@ const compileMenubar = (source, binary) => {
   if (build.status !== 0) throw new Error(`swiftc failed\n${build.stderr.trim()}`)
 }
 
+export async function windowsTray(paths, remove, snapshot, io = {}) {
+  const app = path.join(paths.state, 'app')
+  const binary = path.join(app, 'Claude Transplant.exe')
+  const runSync = io.spawnSync ?? spawnSync
+  const compile = io.compile ?? compileTray
+  const launch = io.launch ?? ((file) => spawn(file, [], { detached: true, stdio: 'ignore', windowsHide: true }).unref())
+  const stop = () => { runSync('taskkill.exe', ['/F', '/IM', 'Claude Transplant.exe'], { stdio: 'ignore', windowsHide: true }) }
+  if (remove) {
+    stop()
+    runSync('reg.exe', ['delete', TRAY_RUN_KEY, '/v', TRAY_RUN_NAME, '/f'], { stdio: 'ignore', windowsHide: true })
+    await rm(app, { recursive: true, force: true })
+    return 'menubar removed'
+  }
+  const source = path.join(HERE, 'tray.cs')
+  if (snapshot) {
+    const output = path.resolve(snapshot)
+    const scratch = await mkdtemp(path.join(os.tmpdir(), 'claude-transplant-snapshot-'))
+    try {
+      const renderer = path.join(scratch, 'Claude Transplant.exe')
+      compile(source, renderer, false)
+      await mkdir(path.dirname(output), { recursive: true })
+      const shot = runSync(renderer, ['--snapshot', output, '--node', process.execPath, '--script', path.join(HERE, 'transplant.js')], { encoding: 'utf8', windowsHide: true })
+      if (shot.status !== 0) throw new Error(`snapshot failed: ${(shot.stderr || shot.stdout || '').trim()}`)
+    } finally {
+      await rm(scratch, { recursive: true, force: true })
+    }
+    return `snapshot written | ${output}`
+  }
+  const key = sha((await readFile(source, 'utf8')) + VERSION)
+  const built = path.join(app, 'build.sha256')
+  if ((await readFile(built, 'utf8').catch(() => '')) !== key || !(await exists(binary))) {
+    const fresh = `${app}.building`
+    await rm(fresh, { recursive: true, force: true })
+    await mkdir(fresh, { recursive: true })
+    compile(source, path.join(fresh, 'Claude Transplant.exe'), true)
+    await writeFile(path.join(fresh, 'build.sha256'), key)
+    stop()
+    await rm(app, { recursive: true, force: true })
+    await rename(fresh, app)
+  } else {
+    stop()
+  }
+  const script = path.join(app, 'transplant.js')
+  await copyFile(path.join(HERE, 'transplant.js'), script)
+  await copyFile(source, path.join(app, 'tray.cs'))
+  await writeFile(path.join(app, 'package.json'), jsonText({ type: 'module', version: VERSION }))
+  const config = jsonText({ node: process.execPath, script, nodeArgs: [`--max-old-space-size=${menubarHeapMiB()}`] })
+  await mkdir(paths.state, { recursive: true })
+  await writeFile(path.join(paths.state, 'menubar.json'), config)
+  await writeFile(path.join(app, 'menubar.json'), config)
+  const reg = runSync('reg.exe', ['add', TRAY_RUN_KEY, '/v', TRAY_RUN_NAME, '/t', 'REG_SZ', '/d', `"${binary}"`, '/f'], { encoding: 'utf8', windowsHide: true })
+  if (reg.status !== 0) throw new Error(`reg.exe failed: ${(reg.stderr || reg.stdout || '').trim()}`)
+  launch(binary)
+  return `menubar installed | starts at login | ${app}`
+}
+
 async function menubar(paths, remove, snapshot) {
+  if (IS_WINDOWS) return windowsTray(paths, remove, snapshot)
   const app = path.join(paths.state, 'Claude Transplant.app')
   const binary = path.join(app, 'Contents/MacOS/Claude Transplant')
   const agent = path.join(paths.home, 'Library/LaunchAgents', `${LABEL}.plist`)
@@ -5192,6 +5497,7 @@ function parse(argv) {
   if (args.moveOnly && (args.restartApproved || args.dry || (args.cmd && args.cmd !== 'finish'))) throw new Error('--move-only applies only to a move or held continuation')
   if (args.restartApproved && (args.dry || (args.cmd && !['restart', 'finish', 'undo'].includes(args.cmd)))) throw new Error('restart approval applies only to a move, finish, undo, or restart')
   if (args.cmd === 'restart' && incompatible) throw new Error('restart accepts only --json and --restart-approved')
+  if (args.cmd === 'tray') args.cmd = 'menubar'
   if (args.cmd === 'menubar' && (args.from.length || args.to || args.dry || args.cloud || args.json || (args.remove && args.snapshot))) throw new Error('menubar accepts only --remove or --snapshot <png>')
   if (args.cmd !== 'menubar' && (args.remove || args.snapshot)) throw new Error('--remove and --snapshot require menubar')
   if (args.leaveChecks.length && (args.cmd !== 'keep-local' || args.leaveChecks.some(token => !/^[a-f0-9]{64}$/.test(token)))) throw new Error('--leave-check requires a current source-check token and keep-local')
@@ -5204,6 +5510,7 @@ async function main(argv) {
   if (args.help) return process.stdout.write(HELP)
   if (args.version) return process.stdout.write(`${VERSION}\n`)
   if (Number(process.versions.node.split('.')[0]) < 22) throw new Error('Node 22 or newer is required')
+  if (IS_WINDOWS && args.cloud) throw new Error('--cloud is supported on macOS only')
   const paths = layout()
   const out = process.stdout
   const emit = (o) => out.write(`${JSON.stringify(o)}\n`)
@@ -5427,7 +5734,7 @@ async function main(argv) {
         const waiting = source ? deferred.mode === 'local'
           ? waitingSessions({ held: deferred.receipt.held?.filter(held => held.sources.some(member => sameAccount(member, source))), cloudChecks: deferred.receipt.cloudChecks.filter(check => sameAccount(check, source)) })
           : source.waiting ?? [] : []
-        const current = all.find(row => row.active), scheduler = table.some(row => desktopExecutable(row.executable)) &&
+        const current = all.find(row => row.active), scheduler = table.some(row => isDesktopProcess(row, paths.claudeApp)) &&
           (!current || [source, deferred?.receipt.toAccount].some(row => sameAccount(row, current))) &&
           (deferred?.receipt.held ?? []).some(row => row.release !== 'worker')
         const presentation = pendingPresentation(deferred?.receipt ?? {}, source, { active, signedIn }, deferred?.mode, table, scheduler, timeouts, identity)
@@ -5546,7 +5853,7 @@ async function main(argv) {
 
 const invoked = (() => {
   try {
-    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
+    return Boolean(process.argv[1]) && sameMapped(realpathSync(process.argv[1]), realpathSync(fileURLToPath(import.meta.url)))
   } catch {
     return false
   }
